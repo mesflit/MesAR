@@ -1,4 +1,4 @@
-# Mesflit's Arch Repository
+# Mesflit's Arch Repo
 
 Custom Arch Linux PKGBUILD collection tailored for Arch Linux and its derivatives (CachyOS, EndeavourOS, Manjaro, etc.).
 
