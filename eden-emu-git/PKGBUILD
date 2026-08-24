@@ -1,0 +1,59 @@
+# Maintainer: mesflit <mesflit@localhost>
+
+pkgname=eden-emu-git
+_pkgname=eden
+pkgver=r28867.d9336ce6ce
+pkgrel=1
+pkgdesc="Eden Switch Emulator"
+arch=('x86_64' 'aarch64')
+url="https://git.eden-emu.dev/eden-emu/eden"
+license=('GPL-3.0-or-later')
+depends=(
+  'qt6-base'
+  'qt6-multimedia'
+  'qt6-svg'
+  'qt6-charts'
+  'shared-mime-info'
+  'hicolor-icon-theme'
+  'glibc'
+  'gcc-libs'
+  'vulkan-icd-loader'
+  'openssl'
+)
+makedepends=(
+  'git'
+  'cmake'
+  'ninja'
+  'qt6-tools'
+  'vulkan-headers'
+)
+provides=("${_pkgname}")
+conflicts=("${_pkgname}")
+source=("git+https://git.eden-emu.dev/eden-emu/eden.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "${_pkgname}"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "${_pkgname}"
+  git submodule update --init --recursive
+}
+
+build() {
+  cmake -S "${_pkgname}" -B build \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DYUZU_TESTS=OFF \
+    -DVulkanHeaders_FORCE_BUNDLED=ON \
+    -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
+
+  cmake --build build
+}
+
+package() {
+  DESTDIR="${pkgdir}" cmake --install build
+}
