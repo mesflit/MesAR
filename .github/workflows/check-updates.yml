@@ -5,50 +5,143 @@ on:
     - cron: '0 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   update-pkgbuilds:
     runs-on: ubuntu-latest
+
     container:
       image: archlinux:base-devel
 
     steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # ============================================================
+      # INSTALL DEPENDENCIES
+      # ============================================================
 
       - name: Install Dependencies
         run: |
           echo "::group::Arch Linux Package Installation Logs"
-          pacman -Syu --noconfirm pacman-contrib git curl jq
+
+          pacman -Syu --noconfirm \
+            pacman-contrib \
+            git \
+            curl \
+            jq \
+            sudo
+
           echo "::endgroup::"
+
+      # ============================================================
+      # CREATE BUILD USER
+      # ============================================================
+
+      - name: Create Build User
+        run: |
+          useradd \
+            --create-home \
+            --shell /bin/bash \
+            builder
+
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' \
+            > /etc/sudoers.d/builder
+
+          chmod 440 /etc/sudoers.d/builder
+
+          # Repository'nin tamamını builder'a ver
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      # ============================================================
+      # SAFE GIT DIRECTORY
+      # ============================================================
 
       - name: Set Safe Git Directory
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+          sudo -u builder \
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # ============================================================
+      # RUN AUTO UPDATE
+      # ============================================================
+
       - name: Run Auto Update Script
         run: |
           chmod +x auto-update.sh
-          ./auto-update.sh
 
-      - name: Commit and Push Changes
+          echo "::group::MesAR Auto Update"
+
+          sudo -u builder \
+            bash -c "
+              cd '$GITHUB_WORKSPACE'
+              ./auto-update.sh
+            "
+
+          echo "::endgroup::"
+
+      # ============================================================
+      # CHECK CHANGES
+      # ============================================================
+
+      - name: Check for Changes
+        id: changes
         run: |
-          # Ana depo dizinine geri dönüldüğünden emin ol
           cd "$GITHUB_WORKSPACE"
 
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          if [[ -n $(git status --porcelain) ]]; then
-            echo -e "\n::group::Updated and Committed Files"
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+
+            echo "::group::Updated Files"
             git status --short
             echo "::endgroup::"
-            
-            git add .
-            git commit -m "chore(auto-update): update PKGBUILD versions"
-            git push
-            echo "::notice title=MesAR Auto Update::New package versions detected and pushed to repository!"
           else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+
             echo "::notice title=MesAR Auto Update::No updates found, repository is up to date."
           fi
+
+      # ============================================================
+      # COMMIT AND PUSH
+      # ============================================================
+
+      - name: Commit and Push Changes
+        if: steps.changes.outputs.changed == 'true'
+
+        run: |
+          cd "$GITHUB_WORKSPACE"
+
+          git config \
+            user.name \
+            "mesflit"
+
+          git config \
+            user.email \
+            "84642884+mesflit@users.noreply.github.com"
+
+          echo "::group::Git Status"
+
+          git status --short
+
+          echo "::endgroup::"
+
+          git add .
+
+          git commit \
+            -m "chore(auto-update): update PKGBUILD versions"
+
+          git push
+
+          echo "::notice title=MesAR Auto Update::New package versions detected and pushed to repository!"
