@@ -1,0 +1,552 @@
+name: Build MesAR Repository
+
+on:
+  workflow_run:
+    workflows:
+      - "MesAR PKGBUILD Auto Update"
+    types:
+      - completed
+
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+concurrency:
+  group: mesar-repository
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build MesAR packages
+
+    if: |
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    runs-on: ubuntu-latest
+
+    container:
+      image: archlinux:base-devel
+
+    steps:
+
+      # ============================================================
+      # DEPENDENCIES
+      # ============================================================
+
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm \
+            git \
+            sudo \
+            gnupg \
+            pacman-contrib \
+            curl
+
+      # ============================================================
+      # CHECKOUT MAIN
+      # ============================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # ============================================================
+      # BUILD USER
+      # ============================================================
+
+      - name: Configure build user
+        run: |
+          useradd -m -G wheel builder
+
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' \
+            > /etc/sudoers.d/builder
+
+          chmod 440 /etc/sudoers.d/builder
+
+      # ============================================================
+      # GPG
+      # ============================================================
+
+      - name: Import MesAR GPG key
+        env:
+          MESAR_GPG_PRIVATE_KEY: ${{ secrets.MESAR_GPG_PRIVATE_KEY }}
+
+        run: |
+          if [[ -z "$MESAR_GPG_PRIVATE_KEY" ]]; then
+            echo "ERROR: MESAR_GPG_PRIVATE_KEY secret is missing."
+            exit 1
+          fi
+
+          mkdir -p /root/.gnupg
+          chmod 700 /root/.gnupg
+
+          printf '%s\n' "$MESAR_GPG_PRIVATE_KEY" \
+            | gpg --batch --import
+
+      # ============================================================
+      # DETECT GPG KEY
+      # ============================================================
+
+      - name: Detect GPG key
+        id: gpg
+        run: |
+          KEY_ID="$(
+            gpg \
+              --list-secret-keys \
+              --with-colons \
+              | awk -F: '/^sec:/ {print $5; exit}'
+          )"
+
+          if [[ -z "$KEY_ID" ]]; then
+            echo "ERROR: No secret GPG key found."
+            exit 1
+          fi
+
+          echo "key_id=$KEY_ID" >> "$GITHUB_OUTPUT"
+
+          echo "MesAR signing key detected."
+
+      # ============================================================
+      # MAKEPKG
+      # ============================================================
+
+      - name: Configure makepkg
+        env:
+          GPG_KEY: ${{ steps.gpg.outputs.key_id }}
+
+        run: |
+          sed -i \
+            's|^#\?PACKAGER=.*|PACKAGER="MesAR <mesflit@users.noreply.github.com>"|' \
+            /etc/makepkg.conf
+
+          sed -i \
+            "s|^#\?GPGKEY=.*|GPGKEY=\"$GPG_KEY\"|" \
+            /etc/makepkg.conf
+
+      # ============================================================
+      # GH-PAGES
+      # ============================================================
+
+      - name: Prepare binary repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        run: |
+          rm -rf binary-repo
+
+          if git ls-remote \
+            --exit-code \
+            --heads \
+            "https://github.com/${GITHUB_REPOSITORY}.git" \
+            gh-pages \
+            >/dev/null 2>&1; then
+
+            echo "Existing gh-pages branch found."
+
+            git clone \
+              --branch gh-pages \
+              --single-branch \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              binary-repo
+
+          else
+
+            echo "gh-pages does not exist."
+
+            mkdir binary-repo
+
+            cd binary-repo
+
+            git init
+            git checkout -b gh-pages
+
+            git config user.name "mesflit"
+            git config user.email "84642884+mesflit@users.noreply.github.com"
+
+            touch .nojekyll
+
+            git add .
+
+            git commit \
+              -m "chore(repo): initialize MesAR repository"
+
+            git remote add origin \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+            git push origin gh-pages
+
+            cd ..
+          fi
+
+          mkdir -p binary-repo/x86_64
+
+          touch binary-repo/.nojekyll
+
+      # ============================================================
+      # FIND ALL PKGBUILDS
+      # ============================================================
+
+      - name: Detect package directories
+        run: |
+          : > /tmp/mesar-packages
+
+          echo "Searching for PKGBUILD files..."
+
+          find . \
+            -mindepth 2 \
+            -maxdepth 2 \
+            -type f \
+            -name PKGBUILD \
+            -print \
+            | while read -r pkgbuild; do
+
+                dirname "$pkgbuild"
+
+            done \
+            | sort -u \
+            >> /tmp/mesar-packages
+
+          echo
+          echo "Detected packages:"
+          cat /tmp/mesar-packages || true
+
+      # ============================================================
+      # DETECT CHANGED PACKAGES
+      # ============================================================
+
+      - name: Detect changed packages
+        run: |
+          : > /tmp/mesar-changed
+
+          # --------------------------------------------------------
+          # MANUAL
+          # --------------------------------------------------------
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+
+            echo "Manual build requested."
+            echo "Building all packages."
+
+            cp \
+              /tmp/mesar-packages \
+              /tmp/mesar-changed
+
+          # --------------------------------------------------------
+          # AUTO UPDATE
+          # --------------------------------------------------------
+
+          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+
+            echo "MesAR PKGBUILD Auto Update completed."
+
+            git fetch \
+              origin \
+              main \
+              --depth=2
+
+            git diff \
+              --name-only \
+              HEAD^ HEAD \
+              | while read -r file; do
+
+                directory="${file%%/*}"
+
+                if [[ -f "$directory/PKGBUILD" ]]; then
+                  echo "$directory"
+                fi
+
+              done \
+              | sort -u \
+              >> /tmp/mesar-changed
+
+          # --------------------------------------------------------
+          # NORMAL PUSH
+          # --------------------------------------------------------
+
+          else
+
+            echo "Normal push detected."
+
+            git diff \
+              --name-only \
+              HEAD^ HEAD \
+              | while read -r file; do
+
+                directory="${file%%/*}"
+
+                if [[ -f "$directory/PKGBUILD" ]]; then
+                  echo "$directory"
+                fi
+
+              done \
+              | sort -u \
+              >> /tmp/mesar-changed
+
+          fi
+
+          sort -u \
+            /tmp/mesar-changed \
+            -o /tmp/mesar-changed
+
+          echo
+          echo "Packages to build:"
+          cat /tmp/mesar-changed || true
+
+      # ============================================================
+      # BUILD
+      # ============================================================
+
+      - name: Build packages
+        run: |
+          if [[ ! -s /tmp/mesar-changed ]]; then
+            echo "No changed packages detected."
+            exit 0
+          fi
+
+          while read -r directory; do
+
+            [[ -z "$directory" ]] && continue
+
+            echo
+            echo "=================================================="
+            echo "BUILDING: $directory"
+            echo "=================================================="
+
+            chown \
+              -R \
+              builder:builder \
+              "$directory"
+
+            sudo -u builder bash -c "
+              cd '$GITHUB_WORKSPACE/$directory'
+
+              makepkg \
+                --syncdeps \
+                --noconfirm \
+                --clean \
+                --cleanbuild \
+                --sign
+            "
+
+            find "$directory" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.pkg.tar.zst' \
+              -exec cp {} binary-repo/x86_64/ \;
+
+            find "$directory" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.pkg.tar.zst.sig' \
+              -exec cp {} binary-repo/x86_64/ \;
+
+          done < /tmp/mesar-changed
+
+      # ============================================================
+      # REMOVE OLD VERSIONS
+      # ============================================================
+
+      - name: Remove old package versions
+        run: |
+          cd binary-repo/x86_64
+
+          while read -r directory; do
+
+            [[ -z "$directory" ]] && continue
+
+            PKGBASE="$(
+              makepkg \
+                --printsrcinfo \
+                --dir "$GITHUB_WORKSPACE/$directory" \
+                | awk '
+                    /^pkgbase = / {
+                      print $3
+                      exit
+                    }
+                  '
+            )"
+
+            if [[ -z "$PKGBASE" ]]; then
+              echo "WARNING: Could not determine pkgbase for $directory"
+              continue
+            fi
+
+            echo
+            echo "Package base: $PKGBASE"
+
+            mapfile -t PACKAGES < <(
+              ls -1t \
+                "$PKGBASE"-*.pkg.tar.zst \
+                2>/dev/null \
+                || true
+            )
+
+            if (( ${#PACKAGES[@]} <= 1 )); then
+              continue
+            fi
+
+            for ((i=1; i<${#PACKAGES[@]}; i++)); do
+
+              OLD="${PACKAGES[$i]}"
+
+              echo "Removing old version: $OLD"
+
+              rm -f "$OLD"
+              rm -f "$OLD.sig"
+
+            done
+
+          done < /tmp/mesar-changed
+
+      # ============================================================
+      # REPOSITORY DATABASE
+      # ============================================================
+
+      - name: Rebuild repository database
+        run: |
+          cd binary-repo/x86_64
+
+          rm -f mesar.db*
+          rm -f mesar.files*
+
+          shopt -s nullglob
+
+          PACKAGES=(
+            *.pkg.tar.zst
+          )
+
+          if [[ ${#PACKAGES[@]} -eq 0 ]]; then
+            echo "ERROR: No packages found."
+            exit 1
+          fi
+
+          echo
+          echo "MesAR packages:"
+          printf '%s\n' "${PACKAGES[@]}"
+
+          repo-add \
+            --sign \
+            --key "${{ steps.gpg.outputs.key_id }}" \
+            mesar.db.tar.gz \
+            "${PACKAGES[@]}"
+
+          cp \
+            mesar.db.tar.gz \
+            mesar.db
+
+          if [[ -f mesar.db.tar.gz.sig ]]; then
+            cp \
+              mesar.db.tar.gz.sig \
+              mesar.db.sig
+          fi
+
+          if [[ -f mesar.files.tar.gz ]]; then
+            cp \
+              mesar.files.tar.gz \
+              mesar.files
+          fi
+
+          if [[ -f mesar.files.tar.gz.sig ]]; then
+            cp \
+              mesar.files.tar.gz.sig \
+              mesar.files.sig
+          fi
+
+          rm -f mesar.db.tar.gz.old
+          rm -f mesar.files.tar.gz.old
+
+      # ============================================================
+      # PUBLIC KEY
+      # ============================================================
+
+      - name: Export public GPG key
+        run: |
+          gpg \
+            --armor \
+            --export "${{ steps.gpg.outputs.key_id }}" \
+            > binary-repo/mesar-key.asc
+
+      # ============================================================
+      # INDEX
+      # ============================================================
+
+      - name: Create repository index
+        run: |
+          cat > binary-repo/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+            <title>MesAR</title>
+          </head>
+
+          <body>
+
+            <h1>MesAR</h1>
+
+            <p>
+              Mesflit's Arch Repository
+            </p>
+
+            <ul>
+
+              <li>
+                <a href="x86_64/">
+                  x86_64 Repository
+                </a>
+              </li>
+
+              <li>
+                <a href="mesar-key.asc">
+                  MesAR GPG Public Key
+                </a>
+              </li>
+
+            </ul>
+
+          </body>
+
+          </html>
+          EOF
+
+      # ============================================================
+      # PUBLISH
+      # ============================================================
+
+      - name: Publish repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        run: |
+          cd binary-repo
+
+          git config \
+            user.name \
+            "mesflit"
+
+          git config \
+            user.email \
+            "84642884+mesflit@users.noreply.github.com"
+
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "No repository changes."
+            exit 0
+          fi
+
+          git commit \
+            -m "chore(repo): update MesAR packages"
+
+          git push origin gh-pages
