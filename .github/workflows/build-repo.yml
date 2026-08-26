@@ -36,12 +36,13 @@ jobs:
     steps:
 
       # ============================================================
-      # DEPENDENCIES
+      # INSTALL DEPENDENCIES
       # ============================================================
 
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm
+
           pacman -S --noconfirm \
             git \
             sudo \
@@ -50,7 +51,7 @@ jobs:
             curl
 
       # ============================================================
-      # CHECKOUT MAIN
+      # CHECKOUT MAIN REPOSITORY
       # ============================================================
 
       - name: Checkout repository
@@ -97,6 +98,7 @@ jobs:
 
       - name: Detect GPG key
         id: gpg
+
         run: |
           KEY_ID="$(
             gpg \
@@ -112,10 +114,10 @@ jobs:
 
           echo "key_id=$KEY_ID" >> "$GITHUB_OUTPUT"
 
-          echo "MesAR signing key detected."
+          echo "MesAR GPG signing key detected."
 
       # ============================================================
-      # MAKEPKG
+      # CONFIGURE MAKEPKG
       # ============================================================
 
       - name: Configure makepkg
@@ -132,7 +134,7 @@ jobs:
             /etc/makepkg.conf
 
       # ============================================================
-      # GH-PAGES
+      # PREPARE GH-PAGES
       # ============================================================
 
       - name: Prepare binary repository
@@ -192,6 +194,11 @@ jobs:
 
       # ============================================================
       # FIND ALL PKGBUILDS
+      #
+      # Automatically discovers every package.
+      #
+      # EXCLUDED:
+      #   anything ending in -git
       # ============================================================
 
       - name: Detect package directories
@@ -199,6 +206,7 @@ jobs:
           : > /tmp/mesar-packages
 
           echo "Searching for PKGBUILD files..."
+          echo
 
           find . \
             -mindepth 2 \
@@ -208,14 +216,30 @@ jobs:
             -print \
             | while read -r pkgbuild; do
 
-                dirname "$pkgbuild"
+                directory="$(dirname "$pkgbuild")"
+                package_name="$(basename "$directory")"
 
-            done \
-            | sort -u \
-            >> /tmp/mesar-packages
+                if [[ "$package_name" == *-git ]]; then
+                  echo "SKIP -git: $package_name"
+                  continue
+                fi
+
+                echo "FOUND: $package_name"
+
+                echo "$directory" \
+                  >> /tmp/mesar-packages
+
+            done
+
+          sort -u \
+            /tmp/mesar-packages \
+            -o /tmp/mesar-packages
 
           echo
-          echo "Detected packages:"
+          echo "=============================================="
+          echo "Packages allowed in MesAR:"
+          echo "=============================================="
+
           cat /tmp/mesar-packages || true
 
       # ============================================================
@@ -226,22 +250,22 @@ jobs:
         run: |
           : > /tmp/mesar-changed
 
-          # --------------------------------------------------------
-          # MANUAL
-          # --------------------------------------------------------
+          # ========================================================
+          # MANUAL BUILD
+          # ========================================================
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
 
             echo "Manual build requested."
-            echo "Building all packages."
+            echo "Building all non--git packages."
 
             cp \
               /tmp/mesar-packages \
               /tmp/mesar-changed
 
-          # --------------------------------------------------------
-          # AUTO UPDATE
-          # --------------------------------------------------------
+          # ========================================================
+          # WORKFLOW RUN
+          # ========================================================
 
           elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
 
@@ -260,16 +284,28 @@ jobs:
                 directory="${file%%/*}"
 
                 if [[ -f "$directory/PKGBUILD" ]]; then
-                  echo "$directory"
+
+                  package_name="$(basename "$directory")"
+
+                  if [[ "$package_name" == *-git ]]; then
+
+                    echo "SKIP changed -git: $package_name"
+
+                  else
+
+                    echo "$directory"
+
+                  fi
+
                 fi
 
               done \
               | sort -u \
               >> /tmp/mesar-changed
 
-          # --------------------------------------------------------
+          # ========================================================
           # NORMAL PUSH
-          # --------------------------------------------------------
+          # ========================================================
 
           else
 
@@ -283,7 +319,19 @@ jobs:
                 directory="${file%%/*}"
 
                 if [[ -f "$directory/PKGBUILD" ]]; then
-                  echo "$directory"
+
+                  package_name="$(basename "$directory")"
+
+                  if [[ "$package_name" == *-git ]]; then
+
+                    echo "SKIP changed -git: $package_name"
+
+                  else
+
+                    echo "$directory"
+
+                  fi
+
                 fi
 
               done \
@@ -297,27 +345,45 @@ jobs:
             -o /tmp/mesar-changed
 
           echo
+          echo "=============================================="
           echo "Packages to build:"
+          echo "=============================================="
+
           cat /tmp/mesar-changed || true
 
       # ============================================================
-      # BUILD
+      # BUILD PACKAGES
       # ============================================================
 
       - name: Build packages
         run: |
+
           if [[ ! -s /tmp/mesar-changed ]]; then
-            echo "No changed packages detected."
+
+            echo "No packages need rebuilding."
+
             exit 0
+
           fi
 
           while read -r directory; do
 
             [[ -z "$directory" ]] && continue
 
+            package_name="$(basename "$directory")"
+
+            # Extra safety check
+            if [[ "$package_name" == *-git ]]; then
+
+              echo "SAFETY SKIP: $package_name"
+
+              continue
+
+            fi
+
             echo
             echo "=================================================="
-            echo "BUILDING: $directory"
+            echo "BUILDING: $package_name"
             echo "=================================================="
 
             chown \
@@ -351,16 +417,23 @@ jobs:
           done < /tmp/mesar-changed
 
       # ============================================================
-      # REMOVE OLD VERSIONS
+      # REMOVE OLD PACKAGE VERSIONS
       # ============================================================
 
       - name: Remove old package versions
         run: |
+
           cd binary-repo/x86_64
 
           while read -r directory; do
 
             [[ -z "$directory" ]] && continue
+
+            package_name="$(basename "$directory")"
+
+            if [[ "$package_name" == *-git ]]; then
+              continue
+            fi
 
             PKGBASE="$(
               makepkg \
@@ -375,8 +448,12 @@ jobs:
             )"
 
             if [[ -z "$PKGBASE" ]]; then
-              echo "WARNING: Could not determine pkgbase for $directory"
+
+              echo "WARNING:"
+              echo "Could not determine pkgbase for $directory"
+
               continue
+
             fi
 
             echo
@@ -397,7 +474,8 @@ jobs:
 
               OLD="${PACKAGES[$i]}"
 
-              echo "Removing old version: $OLD"
+              echo "Removing old version:"
+              echo "$OLD"
 
               rm -f "$OLD"
               rm -f "$OLD.sig"
@@ -407,11 +485,12 @@ jobs:
           done < /tmp/mesar-changed
 
       # ============================================================
-      # REPOSITORY DATABASE
+      # REBUILD PACMAN DATABASE
       # ============================================================
 
       - name: Rebuild repository database
         run: |
+
           cd binary-repo/x86_64
 
           rm -f mesar.db*
@@ -424,12 +503,18 @@ jobs:
           )
 
           if [[ ${#PACKAGES[@]} -eq 0 ]]; then
+
             echo "ERROR: No packages found."
+
             exit 1
+
           fi
 
           echo
+          echo "=============================================="
           echo "MesAR packages:"
+          echo "=============================================="
+
           printf '%s\n' "${PACKAGES[@]}"
 
           repo-add \
@@ -443,32 +528,39 @@ jobs:
             mesar.db
 
           if [[ -f mesar.db.tar.gz.sig ]]; then
+
             cp \
               mesar.db.tar.gz.sig \
               mesar.db.sig
+
           fi
 
           if [[ -f mesar.files.tar.gz ]]; then
+
             cp \
               mesar.files.tar.gz \
               mesar.files
+
           fi
 
           if [[ -f mesar.files.tar.gz.sig ]]; then
+
             cp \
               mesar.files.tar.gz.sig \
               mesar.files.sig
+
           fi
 
           rm -f mesar.db.tar.gz.old
           rm -f mesar.files.tar.gz.old
 
       # ============================================================
-      # PUBLIC KEY
+      # PUBLIC GPG KEY
       # ============================================================
 
       - name: Export public GPG key
         run: |
+
           gpg \
             --armor \
             --export "${{ steps.gpg.outputs.key_id }}" \
@@ -480,15 +572,23 @@ jobs:
 
       - name: Create repository index
         run: |
+
           cat > binary-repo/index.html <<'EOF'
           <!DOCTYPE html>
+
           <html lang="en">
 
           <head>
+
             <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+            <meta
+              name="viewport"
+              content="width=device-width, initial-scale=1.0"
+            >
 
             <title>MesAR</title>
+
           </head>
 
           <body>
@@ -529,6 +629,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
         run: |
+
           cd binary-repo
 
           git config \
@@ -542,8 +643,11 @@ jobs:
           git add .
 
           if git diff --cached --quiet; then
+
             echo "No repository changes."
+
             exit 0
+
           fi
 
           git commit \
