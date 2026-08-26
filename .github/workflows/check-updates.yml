@@ -3,6 +3,7 @@ name: MesAR PKGBUILD Auto Update
 on:
   schedule:
     - cron: '0 * * * *'
+
   workflow_dispatch:
 
 permissions:
@@ -45,7 +46,7 @@ jobs:
           echo "::endgroup::"
 
       # ============================================================
-      # CREATE BUILD USER
+      # CREATE BUILDER USER
       # ============================================================
 
       - name: Create Build User
@@ -60,19 +61,48 @@ jobs:
 
           chmod 440 /etc/sudoers.d/builder
 
-          # Repository'nin tamamını builder'a ver
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
       # ============================================================
-      # SAFE GIT DIRECTORY
+      # CONFIGURE GIT
       # ============================================================
 
-      - name: Set Safe Git Directory
+      - name: Configure Git
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo -u builder git config \
+            --global user.name \
+            "mesflit"
+
+          sudo -u builder git config \
+            --global user.email \
+            "84642884+mesflit@users.noreply.github.com"
+
+          sudo -u builder git config \
+            --global --add safe.directory \
+            "$GITHUB_WORKSPACE"
+
+          git config \
+            --global --add safe.directory \
+            "$GITHUB_WORKSPACE"
+
+      # ============================================================
+      # VERIFY REPOSITORY
+      # ============================================================
+
+      - name: Verify Git Repository
+        run: |
+          echo "Workspace:"
+          echo "$GITHUB_WORKSPACE"
+
+          echo
+          echo "Git directory:"
+          ls -la "$GITHUB_WORKSPACE/.git"
+
+          echo
+          echo "Current commit:"
 
           sudo -u builder \
-            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            git -C "$GITHUB_WORKSPACE" rev-parse HEAD
 
       # ============================================================
       # RUN AUTO UPDATE
@@ -80,7 +110,7 @@ jobs:
 
       - name: Run Auto Update Script
         run: |
-          chmod +x auto-update.sh
+          chmod +x "$GITHUB_WORKSPACE/auto-update.sh"
 
           echo "::group::MesAR Auto Update"
 
@@ -99,19 +129,41 @@ jobs:
       - name: Check for Changes
         id: changes
         run: |
-          cd "$GITHUB_WORKSPACE"
+          echo "::group::Git Status"
 
-          if [[ -n "$(git status --porcelain)" ]]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+          sudo -u builder \
+            git -C "$GITHUB_WORKSPACE" status --short
 
-            echo "::group::Updated Files"
-            git status --short
-            echo "::endgroup::"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
 
-            echo "::notice title=MesAR Auto Update::No updates found, repository is up to date."
+          if sudo -u builder \
+            git -C "$GITHUB_WORKSPACE" diff --quiet
+          then
+
+            if sudo -u builder \
+              git -C "$GITHUB_WORKSPACE" diff --cached --quiet
+            then
+
+              if [[ -z "$(
+                sudo -u builder \
+                git -C "$GITHUB_WORKSPACE" status --porcelain
+              )" ]]; then
+
+                echo "changed=false" >> "$GITHUB_OUTPUT"
+
+                echo "::notice title=MesAR Auto Update::No updates found, repository is up to date."
+
+                exit 0
+
+              fi
+
+            fi
+
           fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          echo "::notice title=MesAR Auto Update::Changes detected."
 
       # ============================================================
       # COMMIT AND PUSH
@@ -121,27 +173,25 @@ jobs:
         if: steps.changes.outputs.changed == 'true'
 
         run: |
-          cd "$GITHUB_WORKSPACE"
+          echo "::group::Updated Files"
 
-          git config \
-            user.name \
-            "mesflit"
-
-          git config \
-            user.email \
-            "84642884+mesflit@users.noreply.github.com"
-
-          echo "::group::Git Status"
-
-          git status --short
+          sudo -u builder \
+            git -C "$GITHUB_WORKSPACE" status --short
 
           echo "::endgroup::"
 
-          git add .
+          sudo -u builder \
+            git -C "$GITHUB_WORKSPACE" add .
 
-          git commit \
-            -m "chore(auto-update): update PKGBUILD versions"
+          sudo -u builder \
+            git -C "$GITHUB_WORKSPACE" commit \
+              -m "chore(auto-update): update PKGBUILD versions"
 
-          git push
+          echo "::group::Push Changes"
+
+          sudo -u builder \
+            git -C "$GITHUB_WORKSPACE" push
+
+          echo "::endgroup::"
 
           echo "::notice title=MesAR Auto Update::New package versions detected and pushed to repository!"
