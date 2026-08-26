@@ -14,14 +14,20 @@ jobs:
 
     steps:
 
-      # Checkout Git repository on GitHub runner
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      # Run Arch environment inside Docker
+      # ============================================================
+      # RUN AUTO UPDATE INSIDE ARCH
+      # ============================================================
+
       - name: Run Auto Update Script
         run: |
           docker run --rm \
@@ -95,7 +101,10 @@ jobs:
               echo "=============================================="
             '
 
-      # Check whether auto-update changed anything
+      # ============================================================
+      # CHECK CHANGES
+      # ============================================================
+
       - name: Check for Changes
         id: changes
         run: |
@@ -109,13 +118,18 @@ jobs:
 
           if [[ -n "$(git status --porcelain)" ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
+
             echo "::notice title=MesAR Auto Update::Changes detected."
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
+
             echo "::notice title=MesAR Auto Update::No updates found, repository is up to date."
           fi
 
-      # Commit updated PKGBUILDs
+      # ============================================================
+      # COMMIT AND PUSH
+      # ============================================================
+
       - name: Commit and Push Changes
         if: steps.changes.outputs.changed == 'true'
         run: |
