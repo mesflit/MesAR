@@ -25,7 +25,7 @@ jobs:
           fetch-depth: 0
 
       # ============================================================
-      # RUN AUTO UPDATE IN ARCH
+      # RUN AUTO UPDATE INSIDE ARCH
       # ============================================================
 
       - name: Run Auto Update Script
@@ -45,7 +45,7 @@ jobs:
 
               set -e
 
-              echo "==> Updating Arch package databases..."
+              echo "==> Installing Arch dependencies..."
 
               pacman -Syu --noconfirm \
                 pacman-contrib \
@@ -54,7 +54,7 @@ jobs:
                 jq \
                 sudo
 
-              echo "==> Creating non-root build user..."
+              echo "==> Creating builder user..."
 
               useradd \
                 --create-home \
@@ -86,17 +86,55 @@ jobs:
 
               echo "==> Running auto-update.sh..."
 
-              chmod +x /workspace/auto-update.sh
-
               sudo -u builder \
-                bash -c "
-                  cd /workspace
-                  ./auto-update.sh
-                "
+                bash /workspace/auto-update.sh
+
+              echo "==> Removing generated archive files..."
+
+              find /workspace \
+                -type f \
+                \( \
+                  -name "*.pkg.tar.zst" \
+                  -o -name "*.pkg.tar.zst.sig" \
+                  -o -name "*.tar.zst" \
+                \) \
+                -delete
+
+              echo "==> Archive cleanup completed."
 
               echo "==> Auto update completed."
 
             '
+
+          echo "==> Restoring workspace ownership..."
+
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+
+          echo "==> Workspace ownership restored."
+
+      # ============================================================
+      # FINAL SAFETY CLEANUP
+      # ============================================================
+
+      - name: Remove Generated Archives
+        shell: bash
+        run: |
+          set -e
+
+          cd "$GITHUB_WORKSPACE"
+
+          echo "==> Removing any remaining generated archives..."
+
+          find . \
+            -type f \
+            \( \
+              -name "*.pkg.tar.zst" \
+              -o -name "*.pkg.tar.zst.sig" \
+              -o -name "*.tar.zst" \
+            \) \
+            -delete
+
+          echo "==> Archive cleanup completed."
 
       # ============================================================
       # CHECK CHANGES
@@ -120,12 +158,10 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
 
             echo "::notice title=MesAR Auto Update::Package updates detected."
-
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
 
             echo "::notice title=MesAR Auto Update::No package updates found."
-
           fi
 
       # ============================================================
@@ -149,6 +185,12 @@ jobs:
 
           git config user.email \
             "84642884+mesflit@users.noreply.github.com"
+
+          echo "::group::Files to commit"
+
+          git status --short
+
+          echo "::endgroup::"
 
           git add .
 
