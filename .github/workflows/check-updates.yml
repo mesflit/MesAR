@@ -2,9 +2,8 @@ name: MesAR PKGBUILD Auto Update
 
 on:
   schedule:
-    # Runs every hour at minute 0 (her 1 saatte bir çalışır)
     - cron: '0 * * * *'
-  workflow_dispatch: # Allows manual trigger from GitHub UI (Manuel tetikleme butonu)
+  workflow_dispatch:
 
 jobs:
   update-pkgbuilds:
@@ -26,7 +25,7 @@ jobs:
 
       - name: Set Safe Git Directory
         run: |
-          git config --global --add safe.directory /__w/MesAR/MesAR
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Run Auto Update Script
         run: |
@@ -35,8 +34,11 @@ jobs:
 
       - name: Commit and Push Changes
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Ana depo dizinine geri dönüldüğünden emin ol
+          cd "$GITHUB_WORKSPACE"
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
           if [[ -n $(git status --porcelain) ]]; then
             echo -e "\n::group::Updated and Committed Files"
