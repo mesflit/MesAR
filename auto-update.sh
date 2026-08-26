@@ -1,111 +1,320 @@
 #!/usr/bin/env bash
-set -eo pipefail
 
-# Log color definitions
+set -uo pipefail
+
 CYAN='\033[0;36m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-echo -e "${CYAN}[START] Starting MesAR PKGBUILD version check...${NC}\n"
+ROOT_DIR=$PWD
+DRY_RUN=${DRY_RUN:-0}
 
-find . -maxdepth 2 -mindepth 2 -name "PKGBUILD" | while read -r pkgpath; do
-  pkgdir=$(dirname "$pkgpath" | sed 's|^\./||')
+print_log() {
+    printf '%b\n' "$*"
+}
 
-  echo -e "${CYAN}--------------------------------------------------${NC}"
-  
-  # 1. Skip ONLY if directory ends with -git (VCS package)
-  if [[ "$pkgdir" == *-git ]]; then
-    echo -e "${YELLOW}[SKIPPED] ${pkgdir}${NC} -> VCS (-git) package, skipping check."
-    continue
-  fi
+error_exit() {
+    print_log "${RED}[ERROR]${NC} $*" >&2
+    exit 1
+}
 
-  echo -e "==> Checking: ${CYAN}${pkgdir}${NC}"
+command -v bash >/dev/null 2>&1 ||
+    error_exit "bash was not found."
 
-  cd "$pkgdir"
+command -v git >/dev/null 2>&1 ||
+    error_exit "git was not found."
 
-  # Read PKGBUILD variables safely
-  current_pkgver=$(bash -c 'source PKGBUILD; echo "$pkgver"' 2>/dev/null || echo "")
-  upstream_url=$(bash -c 'source PKGBUILD; echo "$url"' 2>/dev/null || echo "")
-  
-  # Extract any git repository link from PKGBUILD (source array or url)
-  git_repo=$(bash -c 'source PKGBUILD; echo "${source[@]}" "$url"' 2>/dev/null | grep -oP 'https?://[^\s#]+\.git' | head -n 1 || true)
+command -v curl >/dev/null 2>&1 ||
+    error_exit "curl was not found."
 
-  if [ -z "$git_repo" ] && [ -n "$upstream_url" ]; then
-    git_repo="$upstream_url"
-  fi
+command -v vercmp >/dev/null 2>&1 ||
+    error_exit "vercmp was not found. Install the pacman-contrib package."
 
-  echo -e "  |-> Current PKGBUILD Version : ${YELLOW}${current_pkgver:-Unknown}${NC}"
-  echo -e "  |-> Upstream URL             : ${upstream_url:-None}"
+command -v updpkgsums >/dev/null 2>&1 ||
+    error_exit "updpkgsums was not found. Install the pacman-contrib package."
 
-  latest_ver=""
+read_pkgbuild_var() {
+    local variable=$1
 
-  # Check if directory name targets pre-releases (e.g., eden-beta, app-rc, pkg-dev)
-  if [[ "$pkgdir" =~ -(beta|rc|alpha|preview|dev)$ ]]; then
-    echo -e "  |-> Mode                     : ${YELLOW}PRE-RELEASE ALLOWED${NC} (Suffix detected)"
-    
-    # 2A. Fetch latest tag including pre-releases
-    if [ -n "$git_repo" ]; then
-      latest_ver=$(git ls-remote --tags --refs "$git_repo" 2>/dev/null | \
-        grep -oP 'refs/tags/v?\K[0-9]+(\.[0-9]+)+.*' | \
-        sort -V | tail -n 1 || true)
+    bash -c "
+        set +u
+        source ./PKGBUILD >/dev/null 2>&1
+        printf '%s' \"\${${variable}:-}\"
+    " 2>/dev/null
+}
+
+get_git_repo() {
+    local source_value
+    local upstream_url
+    local repo
+
+    source_value=$(read_pkgbuild_var source)
+    upstream_url=$(read_pkgbuild_var url)
+
+    repo=$(
+        {
+            printf '%s\n' "$source_value"
+            printf '%s\n' "$upstream_url"
+        } |
+            grep -oE '(https?|git)://[^[:space:]"]+\.git' |
+            head -n 1
+    )
+
+    repo=${repo#git+}
+    repo=${repo%%#*}
+
+    printf '%s' "$repo"
+}
+
+get_github_repo() {
+    local url=$1
+
+    url=${url#https://github.com/}
+    url=${url#http://github.com/}
+    url=${url%%\?*}
+    url=${url%%\#*}
+    url=${url%.git}
+    url=${url%/}
+
+    if [[ "$url" =~ ^[^/]+/[^/]+$ ]]; then
+        printf '%s' "$url"
+    fi
+}
+
+get_git_version() {
+    local repo=$1
+    local include_prerelease=$2
+    local tags
+
+    tags=$(
+        git ls-remote --tags --refs "$repo" 2>/dev/null |
+            awk -F/ '
+                {
+                    tag = $3
+                    sub(/^v/, "", tag)
+                    print tag
+                }
+            ' |
+            grep -E '^[0-9]+([.][0-9]+)+(.*)?$' ||
+            true
+    )
+
+    if [[ "$include_prerelease" != "1" ]]; then
+        tags=$(
+            printf '%s\n' "$tags" |
+                grep -Eiv \
+                    '(^|[._-])(alpha|beta|rc|pre|preview|dev|devel|next|a[0-9]*|b[0-9]*)($|[._-]|[0-9])' ||
+                true
+        )
     fi
 
-    # Fallback to GitHub API (All releases including pre-releases)
-    if [ -z "$latest_ver" ] && [[ "$upstream_url" == *"github.com"* ]]; then
-      repo_path=$(echo "$upstream_url" | sed -e 's|https://github.com/||' -e 's|/$||')
-      latest_ver=$(curl -s "https://api.github.com/repos/$repo_path/releases" | \
-        grep -oP '"tag_name":\s*"v?\K[^"]+' | head -n 1 || true)
+    if [[ -n "$tags" ]]; then
+        printf '%s\n' "$tags" |
+            sort -V |
+            tail -n 1
     fi
+}
 
-  else
-    echo -e "  |-> Mode                     : ${GREEN}STABLE ONLY${NC} (Normal package)"
-    
-    # 2B. Fetch ONLY stable tags (Filter out rc, beta, alpha, dev, preview)
-    if [ -n "$git_repo" ]; then
-      latest_ver=$(git ls-remote --tags --refs "$git_repo" 2>/dev/null | \
-        grep -oP 'refs/tags/v?\K[0-9]+(\.[0-9]+)+.*' | \
-        grep -vE '(-|/)?(rc|alpha|beta|dev|preview|next|b[0-9]+|a[0-9]+)' | \
-        sort -V | tail -n 1 || true)
-    fi
+get_github_version() {
+    local repo=$1
+    local include_prerelease=$2
+    local api_url
+    local response
+    local version
 
-    # Fallback to GitHub API (Latest stable release only)
-    if [ -z "$latest_ver" ] && [[ "$upstream_url" == *"github.com"* ]]; then
-      repo_path=$(echo "$upstream_url" | sed -e 's|https://github.com/||' -e 's|/$||')
-      latest_ver=$(curl -s "https://api.github.com/repos/$repo_path/releases/latest" | \
-        grep -oP '"tag_name":\s*"v?\K[^"]+' || true)
-    fi
-  fi
-
-  # Convert hyphens to underscores for Arch Linux PKGBUILD compliance (e.g., 1.0.0-beta1 -> 1.0.0_beta1)
-  if [ -n "$latest_ver" ]; then
-    latest_ver=$(echo "$latest_ver" | tr '-' '_')
-  fi
-
-  echo -e "  |-> Detected Latest Version  : ${GREEN}${latest_ver:-Not Found}${NC}"
-
-  # 3. Check for updates and apply changes
-  if [ -n "$latest_ver" ] && [ "$latest_ver" != "$current_pkgver" ]; then
-    echo -e "  ${GREEN}[+] NEW VERSION FOUND!${NC} Updating: ${YELLOW}${current_pkgver}${NC} -> ${GREEN}${latest_ver}${NC}"
-    
-    sed -i "s/^pkgver=.*/pkgver=$latest_ver/" PKGBUILD
-    sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-    
-    echo -e "  |-> Updating checksums (updpkgsums)..."
-    if updpkgsums 2>&1 | sed 's/^/      /'; then
-      echo -e "  ${GREEN}[OK] PKGBUILD and checksums updated successfully.${NC}"
+    if [[ "$include_prerelease" == "1" ]]; then
+        api_url="https://api.github.com/repos/${repo}/releases"
     else
-      echo -e "  ${RED}[ERROR] Failed to update checksums!${NC}"
+        api_url="https://api.github.com/repos/${repo}/releases/latest"
     fi
-  elif [ -z "$latest_ver" ]; then
-    echo -e "  ${RED}[!] WARNING:${NC} Could not fetch upstream version."
-  else
-    echo -e "  ${GREEN}[OK] Package is already up to date.${NC}"
-  fi
 
-  cd ..
-done
+    response=$(
+        curl \
+            --fail \
+            --silent \
+            --show-error \
+            --connect-timeout 10 \
+            --max-time 30 \
+            -H 'Accept: application/vnd.github+json' \
+            "$api_url" 2>/dev/null
+    ) || return 0
 
-echo -e "\n${CYAN}--------------------------------------------------${NC}"
-echo -e "${CYAN}[END] Version check completed.${NC}"
+    if command -v jq >/dev/null 2>&1; then
+        if [[ "$include_prerelease" == "1" ]]; then
+            version=$(
+                jq -r '
+                    .[]
+                    | select(.draft == false)
+                    | .tag_name
+                ' <<< "$response" |
+                    sed -E 's/^v//' |
+                    grep -E '^[0-9]+([.][0-9]+)+(.*)?$' |
+                    sort -V |
+                    tail -n 1
+            )
+        else
+            version=$(
+                jq -r '.tag_name // empty' <<< "$response" |
+                    sed -E 's/^v//'
+            )
+        fi
+    else
+        version=$(
+            grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' <<< "$response" |
+                head -n 1 |
+                sed -E 's/.*"([^"]+)".*/\1/' |
+                sed -E 's/^v//'
+        )
+    fi
+
+    printf '%s' "$version"
+}
+
+check_package() {
+    local pkgdir=$1
+
+    (
+        cd "$ROOT_DIR/$pkgdir" || {
+            print_log "${RED}[ERROR]${NC} Could not enter directory: $pkgdir"
+            return 1
+        }
+
+        local current_pkgver
+        local upstream_url
+        local git_repo
+        local latest_ver
+        local github_repo
+        local include_prerelease=0
+        local backup_file
+
+        print_log "${CYAN}--------------------------------------------------${NC}"
+        print_log "==> Checking: ${CYAN}${pkgdir}${NC}"
+
+        if [[ "$pkgdir" == *-git ]]; then
+            print_log "${YELLOW}[SKIPPED]${NC} ${pkgdir} -> VCS package"
+            return 0
+        fi
+
+        current_pkgver=$(read_pkgbuild_var pkgver)
+        upstream_url=$(read_pkgbuild_var url)
+        git_repo=$(get_git_repo || true)
+
+        print_log "  |-> Current PKGBUILD version: ${YELLOW}${current_pkgver:-Unknown}${NC}"
+        print_log "  |-> Upstream URL: ${upstream_url:-None}"
+
+        if [[ "$pkgdir" =~ -(beta|rc|alpha|preview|dev)$ ]]; then
+            include_prerelease=1
+            print_log "  |-> Mode: ${YELLOW}PRERELEASES ALLOWED${NC}"
+        else
+            print_log "  |-> Mode: ${GREEN}STABLE RELEASES ONLY${NC}"
+        fi
+
+        latest_ver=""
+
+        if [[ -n "$git_repo" ]]; then
+            print_log "  |-> Git repository: $git_repo"
+
+            latest_ver=$(
+                get_git_version "$git_repo" "$include_prerelease" || true
+            )
+        fi
+
+        if [[ -z "$latest_ver" && -n "$upstream_url" ]]; then
+            github_repo=$(get_github_repo "$upstream_url" || true)
+
+            if [[ -n "$github_repo" ]]; then
+                print_log "  |-> Using GitHub API: $github_repo"
+
+                latest_ver=$(
+                    get_github_version "$github_repo" "$include_prerelease" || true
+                )
+            fi
+        fi
+
+        latest_ver=${latest_ver//-/_}
+
+        print_log "  |-> Latest detected version: ${GREEN}${latest_ver:-Not Found}${NC}"
+
+        if [[ -z "$latest_ver" ]]; then
+            print_log "  ${RED}[WARNING]${NC} Could not fetch the upstream version."
+            return 0
+        fi
+
+        if [[ -z "$current_pkgver" ]]; then
+            print_log "  ${RED}[WARNING]${NC} Could not read the current pkgver."
+            return 0
+        fi
+
+        if [[ "$latest_ver" == "$current_pkgver" ]]; then
+            print_log "  ${GREEN}[OK]${NC} Package is already up to date."
+            return 0
+        fi
+
+        if (( $(vercmp "$latest_ver" "$current_pkgver") <= 0 )); then
+            print_log "  ${GREEN}[OK]${NC} No newer version was found."
+            return 0
+        fi
+
+        print_log "  ${GREEN}[+] NEW VERSION FOUND${NC}"
+        print_log "      ${YELLOW}${current_pkgver}${NC} -> ${GREEN}${latest_ver}${NC}"
+
+        if [[ "$DRY_RUN" == "1" ]]; then
+            print_log "  ${YELLOW}[DRY-RUN]${NC} No changes were made."
+            return 0
+        fi
+
+        backup_file=$(mktemp)
+        cp PKGBUILD "$backup_file"
+
+        if grep -qE '^pkgver=' PKGBUILD; then
+            sed -i -E "s/^pkgver=.*/pkgver=${latest_ver}/" PKGBUILD
+        else
+            print_log "  ${RED}[ERROR]${NC} pkgver was not found in PKGBUILD."
+            rm -f "$backup_file"
+            return 1
+        fi
+
+        if grep -qE '^pkgrel=' PKGBUILD; then
+            sed -i -E 's/^pkgrel=.*/pkgrel=1/' PKGBUILD
+        else
+            print_log "  ${YELLOW}[WARNING]${NC} pkgrel was not found. Adding it."
+            sed -i '1i pkgrel=1' PKGBUILD
+        fi
+
+        print_log "  |-> Updating checksums..."
+
+        if updpkgsums; then
+            rm -f "$backup_file"
+            print_log "  ${GREEN}[OK]${NC} PKGBUILD and checksums were updated."
+        else
+            cp "$backup_file" PKGBUILD
+            rm -f "$backup_file"
+
+            print_log "  ${RED}[ERROR]${NC} updpkgsums failed."
+            print_log "  ${YELLOW}[ROLLBACK]${NC} PKGBUILD was restored."
+        fi
+    )
+}
+
+print_log "${CYAN}[START] Starting PKGBUILD version check...${NC}"
+printf '\n'
+
+while IFS= read -r -d '' pkgpath; do
+    pkgdir=${pkgpath#./}
+    pkgdir=${pkgdir%/PKGBUILD}
+
+    check_package "$pkgdir"
+done < <(
+    find . \
+        -mindepth 2 \
+        -maxdepth 2 \
+        -type f \
+        -name 'PKGBUILD' \
+        -print0
+)
+
+printf '\n'
+print_log "${CYAN}--------------------------------------------------${NC}"
+print_log "${CYAN}[END] Version check completed.${NC}"
