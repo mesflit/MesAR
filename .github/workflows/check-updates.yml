@@ -12,92 +12,122 @@ jobs:
   update-pkgbuilds:
     runs-on: ubuntu-latest
 
-    container:
-      image: archlinux:base-devel
-
     steps:
 
+      # Checkout Git repository on GitHub runner
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: Install Dependencies
+      # Run Arch environment inside Docker
+      - name: Run Auto Update Script
         run: |
-          echo "::group::Arch Linux Package Installation Logs"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            archlinux:base-devel \
+            bash -c '
+              set -e
 
-          pacman -Syu --noconfirm \
-            pacman-contrib \
-            git \
-            curl \
-            jq \
-            sudo
+              echo "=============================================="
+              echo "MesAR Arch Build Environment"
+              echo "=============================================="
 
-          echo "::endgroup::"
+              echo
+              echo "Installing dependencies..."
 
-      - name: Create Builder User
+              pacman -Syu --noconfirm \
+                pacman-contrib \
+                git \
+                curl \
+                jq \
+                sudo
+
+              echo
+              echo "Creating builder user..."
+
+              useradd \
+                --create-home \
+                --shell /bin/bash \
+                builder
+
+              echo "builder ALL=(ALL) NOPASSWD: ALL" \
+                > /etc/sudoers.d/builder
+
+              chmod 440 /etc/sudoers.d/builder
+
+              echo
+              echo "Preparing workspace..."
+
+              chown -R builder:builder /workspace
+
+              echo
+              echo "Configuring Git..."
+
+              sudo -u builder git config \
+                --global user.name \
+                "mesflit"
+
+              sudo -u builder git config \
+                --global user.email \
+                "84642884+mesflit@users.noreply.github.com"
+
+              sudo -u builder git config \
+                --global --add safe.directory \
+                /workspace
+
+              echo
+              echo "Running auto-update.sh..."
+
+              chmod +x /workspace/auto-update.sh
+
+              sudo -u builder \
+                bash -c "
+                  cd /workspace
+                  ./auto-update.sh
+                "
+
+              echo
+              echo "=============================================="
+              echo "MesAR Auto Update Finished"
+              echo "=============================================="
+            '
+
+      # Check whether auto-update changed anything
+      - name: Check for Changes
+        id: changes
         run: |
-          useradd \
-            --create-home \
-            --shell /bin/bash \
-            builder
-
-          echo 'builder ALL=(ALL) NOPASSWD: ALL' \
-            > /etc/sudoers.d/builder
-
-          chmod 440 /etc/sudoers.d/builder
-
-          chown -R builder:builder "$GITHUB_WORKSPACE"
-
-      - name: Configure Git
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-          sudo -u builder git config \
-            --global --add safe.directory "$GITHUB_WORKSPACE"
-
-          sudo -u builder git config \
-            --global user.name \
-            "mesflit"
-
-          sudo -u builder git config \
-            --global user.email \
-            "84642884+mesflit@users.noreply.github.com"
-
-      - name: Verify Checkout
-        run: |
-          echo "Workspace: $GITHUB_WORKSPACE"
-
           cd "$GITHUB_WORKSPACE"
 
-          if [[ ! -d .git ]]; then
-            echo "ERROR: Git repository was not checked out."
-            ls -la
-            exit 1
-          fi
+          echo "::group::Git Status"
 
           git status --short
 
-      - name: Run Auto Update Script
-        run: |
-          cd "$GITHUB_WORKSPACE"
-
-          chmod +x auto-update.sh
-
-          echo "::group::MesAR Auto Update"
-
-          sudo -u builder \
-            bash -c "
-              cd '$GITHUB_WORKSPACE'
-              ./auto-update.sh
-            "
-
           echo "::endgroup::"
 
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=MesAR Auto Update::Changes detected."
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=MesAR Auto Update::No updates found, repository is up to date."
+          fi
+
+      # Commit updated PKGBUILDs
       - name: Commit and Push Changes
+        if: steps.changes.outputs.changed == 'true'
         run: |
           cd "$GITHUB_WORKSPACE"
+
+          git config \
+            user.name \
+            "mesflit"
+
+          git config \
+            user.email \
+            "84642884+mesflit@users.noreply.github.com"
 
           echo "::group::Updated Files"
 
@@ -105,19 +135,11 @@ jobs:
 
           echo "::endgroup::"
 
-          if [[ -n "$(git status --porcelain)" ]]; then
+          git add .
 
-            git add .
+          git commit \
+            -m "chore(auto-update): update PKGBUILD versions"
 
-            git commit \
-              -m "chore(auto-update): update PKGBUILD versions"
+          git push
 
-            git push
-
-            echo "::notice title=MesAR Auto Update::New package versions detected and pushed to repository!"
-
-          else
-
-            echo "::notice title=MesAR Auto Update::No updates found, repository is up to date."
-
-          fi
+          echo "::notice title=MesAR Auto Update::New package versions detected and pushed to repository!"
