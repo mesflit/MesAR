@@ -2,7 +2,7 @@ name: MesAR PKGBUILD Auto Update
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       # ============================================================
       # CHECKOUT
       # ============================================================
@@ -24,25 +25,27 @@ jobs:
           fetch-depth: 0
 
       # ============================================================
-      # RUN AUTO UPDATE INSIDE ARCH CONTAINER
+      # RUN AUTO UPDATE IN ARCH
       # ============================================================
 
       - name: Run Auto Update Script
+        shell: bash
         run: |
+          set -e
+
+          echo "=============================================="
+          echo "MesAR PKGBUILD Auto Update"
+          echo "=============================================="
+
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/workspace" \
             -w /workspace \
             archlinux:base-devel \
             bash -c '
+
               set -e
 
-              echo "=============================================="
-              echo "MesAR PKGBUILD Auto Update"
-              echo "Arch Linux Environment"
-              echo "=============================================="
-
-              echo
-              echo "==> Installing dependencies..."
+              echo "==> Updating Arch package databases..."
 
               pacman -Syu --noconfirm \
                 pacman-contrib \
@@ -51,8 +54,7 @@ jobs:
                 jq \
                 sudo
 
-              echo
-              echo "==> Creating builder user..."
+              echo "==> Creating non-root build user..."
 
               useradd \
                 --create-home \
@@ -64,12 +66,10 @@ jobs:
 
               chmod 440 /etc/sudoers.d/builder
 
-              echo
               echo "==> Preparing workspace..."
 
               chown -R builder:builder /workspace
 
-              echo
               echo "==> Configuring Git..."
 
               sudo -u builder git config \
@@ -84,7 +84,6 @@ jobs:
                 --global --add safe.directory \
                 /workspace
 
-              echo
               echo "==> Running auto-update.sh..."
 
               chmod +x /workspace/auto-update.sh
@@ -95,10 +94,8 @@ jobs:
                   ./auto-update.sh
                 "
 
-              echo
-              echo "=============================================="
-              echo "Auto Update Finished"
-              echo "=============================================="
+              echo "==> Auto update completed."
+
             '
 
       # ============================================================
@@ -109,18 +106,26 @@ jobs:
         id: changes
         shell: bash
         run: |
+          set -e
+
           cd "$GITHUB_WORKSPACE"
 
-          echo "::group::Git Status"
+          echo "=============================================="
+          echo "Git Status"
+          echo "=============================================="
+
           git status --short
-          echo "::endgroup::"
 
           if [[ -n "$(git status --porcelain)" ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "::notice title=MesAR Auto Update::Changes detected."
+
+            echo "::notice title=MesAR Auto Update::Package updates detected."
+
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=MesAR Auto Update::No updates found."
+
+            echo "::notice title=MesAR Auto Update::No package updates found."
+
           fi
 
       # ============================================================
@@ -131,20 +136,27 @@ jobs:
         if: steps.changes.outputs.changed == 'true'
         shell: bash
         run: |
+          set -e
+
           cd "$GITHUB_WORKSPACE"
 
-          git config user.name "mesflit"
-          git config user.email "84642884+mesflit@users.noreply.github.com"
+          echo "=============================================="
+          echo "Committing Changes"
+          echo "=============================================="
 
-          echo "::group::Files to commit"
-          git status --short
-          echo "::endgroup::"
+          git config user.name \
+            "mesflit"
+
+          git config user.email \
+            "84642884+mesflit@users.noreply.github.com"
 
           git add .
 
           git commit \
             -m "chore(auto-update): update PKGBUILD versions"
 
+          echo "==> Pushing changes..."
+
           git push
 
-          echo "::notice title=MesAR Auto Update::Changes pushed successfully."
+          echo "::notice title=MesAR Auto Update::Changes successfully pushed."
