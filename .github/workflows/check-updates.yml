@@ -3,7 +3,6 @@ name: MesAR PKGBUILD Auto Update
 on:
   schedule:
     - cron: '0 * * * *'
-
   workflow_dispatch:
 
 permissions:
@@ -18,19 +17,11 @@ jobs:
 
     steps:
 
-      # ============================================================
-      # CHECKOUT
-      # ============================================================
-
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
-
-      # ============================================================
-      # INSTALL DEPENDENCIES
-      # ============================================================
 
       - name: Install Dependencies
         run: |
@@ -45,11 +36,7 @@ jobs:
 
           echo "::endgroup::"
 
-      # ============================================================
-      # CREATE BUILDER USER
-      # ============================================================
-
-      - name: Create Build User
+      - name: Create Builder User
         run: |
           useradd \
             --create-home \
@@ -63,12 +50,13 @@ jobs:
 
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
-      # ============================================================
-      # CONFIGURE GIT
-      # ============================================================
-
       - name: Configure Git
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          sudo -u builder git config \
+            --global --add safe.directory "$GITHUB_WORKSPACE"
+
           sudo -u builder git config \
             --global user.name \
             "mesflit"
@@ -77,40 +65,25 @@ jobs:
             --global user.email \
             "84642884+mesflit@users.noreply.github.com"
 
-          sudo -u builder git config \
-            --global --add safe.directory \
-            "$GITHUB_WORKSPACE"
-
-          git config \
-            --global --add safe.directory \
-            "$GITHUB_WORKSPACE"
-
-      # ============================================================
-      # VERIFY REPOSITORY
-      # ============================================================
-
-      - name: Verify Git Repository
+      - name: Verify Checkout
         run: |
-          echo "Workspace:"
-          echo "$GITHUB_WORKSPACE"
+          echo "Workspace: $GITHUB_WORKSPACE"
 
-          echo
-          echo "Git directory:"
-          ls -la "$GITHUB_WORKSPACE/.git"
+          cd "$GITHUB_WORKSPACE"
 
-          echo
-          echo "Current commit:"
+          if [[ ! -d .git ]]; then
+            echo "ERROR: Git repository was not checked out."
+            ls -la
+            exit 1
+          fi
 
-          sudo -u builder \
-            git -C "$GITHUB_WORKSPACE" rev-parse HEAD
-
-      # ============================================================
-      # RUN AUTO UPDATE
-      # ============================================================
+          git status --short
 
       - name: Run Auto Update Script
         run: |
-          chmod +x "$GITHUB_WORKSPACE/auto-update.sh"
+          cd "$GITHUB_WORKSPACE"
+
+          chmod +x auto-update.sh
 
           echo "::group::MesAR Auto Update"
 
@@ -122,76 +95,29 @@ jobs:
 
           echo "::endgroup::"
 
-      # ============================================================
-      # CHECK CHANGES
-      # ============================================================
-
-      - name: Check for Changes
-        id: changes
-        run: |
-          echo "::group::Git Status"
-
-          sudo -u builder \
-            git -C "$GITHUB_WORKSPACE" status --short
-
-          echo "::endgroup::"
-
-          if sudo -u builder \
-            git -C "$GITHUB_WORKSPACE" diff --quiet
-          then
-
-            if sudo -u builder \
-              git -C "$GITHUB_WORKSPACE" diff --cached --quiet
-            then
-
-              if [[ -z "$(
-                sudo -u builder \
-                git -C "$GITHUB_WORKSPACE" status --porcelain
-              )" ]]; then
-
-                echo "changed=false" >> "$GITHUB_OUTPUT"
-
-                echo "::notice title=MesAR Auto Update::No updates found, repository is up to date."
-
-                exit 0
-
-              fi
-
-            fi
-
-          fi
-
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-
-          echo "::notice title=MesAR Auto Update::Changes detected."
-
-      # ============================================================
-      # COMMIT AND PUSH
-      # ============================================================
-
       - name: Commit and Push Changes
-        if: steps.changes.outputs.changed == 'true'
-
         run: |
+          cd "$GITHUB_WORKSPACE"
+
           echo "::group::Updated Files"
 
-          sudo -u builder \
-            git -C "$GITHUB_WORKSPACE" status --short
+          git status --short
 
           echo "::endgroup::"
 
-          sudo -u builder \
-            git -C "$GITHUB_WORKSPACE" add .
+          if [[ -n "$(git status --porcelain)" ]]; then
 
-          sudo -u builder \
-            git -C "$GITHUB_WORKSPACE" commit \
+            git add .
+
+            git commit \
               -m "chore(auto-update): update PKGBUILD versions"
 
-          echo "::group::Push Changes"
+            git push
 
-          sudo -u builder \
-            git -C "$GITHUB_WORKSPACE" push
+            echo "::notice title=MesAR Auto Update::New package versions detected and pushed to repository!"
 
-          echo "::endgroup::"
+          else
 
-          echo "::notice title=MesAR Auto Update::New package versions detected and pushed to repository!"
+            echo "::notice title=MesAR Auto Update::No updates found, repository is up to date."
+
+          fi
