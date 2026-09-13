@@ -1,0 +1,813 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+APP_NAME="mes-os"
+VERSION="2.0.0"
+
+DIALOG_CMD=""
+BASE=""
+DEVICE_TYPE="Bilinmiyor"
+MODULE_NAME="Bilinmiyor"
+FOUR_ZONE_BASE=""
+
+# ------------------------------------------------------------
+# Dialog / Whiptail
+# ------------------------------------------------------------
+
+find_dialog_program() {
+    if command -v dialog >/dev/null 2>&1; then
+        DIALOG_CMD="dialog"
+    elif command -v whiptail >/dev/null 2>&1; then
+        DIALOG_CMD="whiptail"
+    else
+        clear
+        echo "Hata: dialog veya whiptail kurulmamış."
+        echo
+        echo "Arch Linux:"
+        echo "  sudo pacman -S dialog"
+        echo
+        echo "Debian/Ubuntu:"
+        echo "  sudo apt install dialog"
+        exit 1
+    fi
+}
+
+dialog_msg() {
+    local title="$1"
+    local text="$2"
+
+    "$DIALOG_CMD" \
+        --backtitle "$APP_NAME $VERSION" \
+        --title "$title" \
+        --msgbox "$text" 14 80
+}
+
+dialog_yesno() {
+    local title="$1"
+    local text="$2"
+
+    "$DIALOG_CMD" \
+        --backtitle "$APP_NAME $VERSION" \
+        --title "$title" \
+        --yesno "$text" 14 80
+}
+
+dialog_input() {
+    local title="$1"
+    local text="$2"
+    local default_value="${3:-}"
+
+    "$DIALOG_CMD" \
+        --backtitle "$APP_NAME $VERSION" \
+        --title "$title" \
+        --inputbox "$text" 16 80 "$default_value" \
+        3>&1 1>&2 2>&3
+}
+
+dialog_menu() {
+    local title="$1"
+    shift
+
+    "$DIALOG_CMD" \
+        --backtitle "$APP_NAME $VERSION" \
+        --title "$title" \
+        --menu "Seciminizi yapin:" 24 90 16 \
+        "$@" \
+        3>&1 1>&2 2>&3
+}
+
+# ------------------------------------------------------------
+# Sysfs keşfi
+# ------------------------------------------------------------
+
+detect_sysfs_paths() {
+    local path
+    local module_path
+
+    BASE=""
+    DEVICE_TYPE="Bilinmiyor"
+    MODULE_NAME="Bilinmiyor"
+    FOUR_ZONE_BASE=""
+
+    # Predator yolu
+    for path in /sys/module/*/drivers/platform:acer-wmi/acer-wmi/predator_sense; do
+        if [[ -d "$path" ]]; then
+            BASE="$path"
+            DEVICE_TYPE="Predator"
+            break
+        fi
+    done
+
+    # Nitro yolu
+    if [[ -z "$BASE" ]]; then
+        for path in /sys/module/*/drivers/platform:acer-wmi/acer-wmi/nitro_sense; do
+            if [[ -d "$path" ]]; then
+                BASE="$path"
+                DEVICE_TYPE="Nitro"
+                break
+            fi
+        done
+    fi
+
+    if [[ -n "$BASE" ]]; then
+        module_path="${BASE#/sys/module/}"
+        MODULE_NAME="${module_path%%/*}"
+
+        if [[ -d "$BASE/four_zoned_kb" ]]; then
+            FOUR_ZONE_BASE="$BASE/four_zoned_kb"
+        fi
+
+        return 0
+    fi
+
+    # Bazı kernel sürümlerinde yol farklı isimlendirilmiş olabilir.
+    for path in /sys/module/*/drivers/platform:acer-wmi/acer-wmi; do
+        if [[ -d "$path" ]]; then
+            if [[ -d "$path/predator_sense" ]]; then
+                BASE="$path/predator_sense"
+                DEVICE_TYPE="Predator"
+            elif [[ -d "$path/nitro_sense" ]]; then
+                BASE="$path/nitro_sense"
+                DEVICE_TYPE="Nitro"
+            fi
+
+            if [[ -n "$BASE" ]]; then
+                module_path="${path#/sys/module/}"
+                MODULE_NAME="${module_path%%/*}"
+
+                if [[ -d "$BASE/four_zoned_kb" ]]; then
+                    FOUR_ZONE_BASE="$BASE/four_zoned_kb"
+                fi
+
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
+file_exists() {
+    [[ -n "$BASE" && -e "$BASE/$1" ]]
+}
+
+zone_file_exists() {
+    [[ -n "$FOUR_ZONE_BASE" && -e "$FOUR_ZONE_BASE/$1" ]]
+}
+
+# ------------------------------------------------------------
+# Okuma ve yazma
+# ------------------------------------------------------------
+
+read_value() {
+    local file="$1"
+    local result=""
+
+    if [[ ! -e "$file" ]]; then
+        echo "Desteklenmiyor"
+        return 0
+    fi
+
+    if [[ -r "$file" ]]; then
+        result="$(cat "$file" 2>/dev/null || true)"
+    fi
+
+    # Normal kullanıcı okuyamıyorsa sudo ile tekrar dene.
+    if [[ -z "$result" ]]; then
+        result="$(sudo -n cat "$file" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$result" ]]; then
+        echo "Okunamıyor"
+    else
+        printf '%s' "$result" | tr '\n' ' '
+    fi
+}
+
+write_value() {
+    local file="$1"
+    local value="$2"
+
+    if [[ ! -e "$file" ]]; then
+        dialog_msg "Hata" "Dosya bulunamadı:
+
+$file"
+        return 1
+    fi
+
+    if printf '%s\n' "$value" | sudo tee "$file" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    dialog_msg "Hata" "Değer yazılamadı:
+
+$file
+
+Gönderilen değer:
+$value"
+    return 1
+}
+
+# ------------------------------------------------------------
+# Doğrulama
+# ------------------------------------------------------------
+
+is_integer() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+is_between() {
+    local value="$1"
+    local minimum="$2"
+    local maximum="$3"
+
+    is_integer "$value" || return 1
+    (( value >= minimum && value <= maximum ))
+}
+
+is_hex_color() {
+    [[ "$1" =~ ^[0-9a-fA-F]{6}$ ]]
+}
+
+# ------------------------------------------------------------
+# Sistem bilgisi
+# ------------------------------------------------------------
+
+current_profile() {
+    if [[ -r /sys/firmware/acpi/platform_profile ]]; then
+        read_value "/sys/firmware/acpi/platform_profile"
+    else
+        echo "Desteklenmiyor"
+    fi
+}
+
+profile_choices() {
+    if [[ -r /sys/firmware/acpi/platform_profile_choices ]]; then
+        read_value "/sys/firmware/acpi/platform_profile_choices"
+    else
+        echo "Desteklenmiyor"
+    fi
+}
+
+show_status() {
+    local text=""
+    local kernel
+    local profile
+    local choices
+
+    kernel="$(uname -r)"
+    profile="$(current_profile)"
+    choices="$(profile_choices)"
+
+    text+="Kernel: $kernel\n"
+    text+="Cihaz: $DEVICE_TYPE\n"
+    text+="Modul: $MODULE_NAME\n"
+
+    if [[ -n "$BASE" ]]; then
+        text+="Kontrol yolu:\n$BASE\n"
+        text+="\nPlatform profili: $profile\n"
+        text+="Profil secenekleri: $choices\n"
+    else
+        text+="\nLinuwu-Sense sysfs yolu bulunamadi.\n"
+        text+="Modul yuklu olabilir ancak desteklenen sysfs dizini olusturulmamis olabilir.\n"
+        text+="\nKontrol edilebilecek yollar:\n"
+        text+="/sys/module/*/drivers/platform:acer-wmi/acer-wmi"
+    fi
+
+    dialog_msg "Sistem Durumu" "$text"
+}
+
+# ------------------------------------------------------------
+# Platform profili
+# ------------------------------------------------------------
+
+platform_profile_menu() {
+    local choices
+    local current
+    local selected
+    local item
+    local args=()
+
+    if [[ ! -r /sys/firmware/acpi/platform_profile_choices ]]; then
+        dialog_msg "Platform Profili" \
+            "Bu sistemde platform profili desteklenmiyor."
+        return
+    fi
+
+    choices="$(cat /sys/firmware/acpi/platform_profile_choices 2>/dev/null || true)"
+    current="$(current_profile)"
+
+    for item in $choices; do
+        if [[ "$item" == "$current" ]]; then
+            args+=("$item" "$item - aktif")
+        else
+            args+=("$item" "$item")
+        fi
+    done
+
+    if [[ "${#args[@]}" -eq 0 ]]; then
+        dialog_msg "Platform Profili" \
+            "Desteklenen profil bulunamadı."
+        return
+    fi
+
+    selected="$(dialog_menu "Platform Profili" "${args[@]}")" || return
+
+    if write_value "/sys/firmware/acpi/platform_profile" "$selected"; then
+        dialog_msg "Platform Profili" \
+            "Aktif profil:
+
+$selected"
+    fi
+}
+
+# ------------------------------------------------------------
+# Aç / kapat özellikleri
+# ------------------------------------------------------------
+
+toggle_feature() {
+    local filename="$1"
+    local title="$2"
+    local description="${3:-Bu ozelligi acmak veya kapatmak icin secim yapin.}"
+    local path="$BASE/$filename"
+    local current
+    local selected
+
+    current="$(read_value "$path")"
+
+    selected="$(dialog_menu "$title" \
+        "1" "Etkinlestir" \
+        "0" "Devre disi birak" \
+        "cancel" "Iptal")" || return
+
+    [[ "$selected" == "cancel" ]] && return
+
+    if write_value "$path" "$selected"; then
+        dialog_msg "$title" \
+            "$description
+
+Onceki deger: $current
+Yeni deger: $selected"
+    fi
+}
+
+battery_calibration_menu() {
+    local path="$BASE/battery_calibration"
+    local current
+
+    current="$(read_value "$path")"
+
+    if dialog_yesno "Pil Kalibrasyonu" \
+        "Mevcut deger: $current
+
+Pil kalibrasyonunu baslatmak istiyor musunuz?
+
+Kalibrasyon sirasinda:
+- Bilgisayari AC adaptorden cikarmayin.
+- Islem uzun surebilir.
+- Pil tamamen bosalip tekrar doldurulabilir."; then
+
+        if write_value "$path" "1"; then
+            dialog_msg "Pil Kalibrasyonu" \
+                "Kalibrasyon baslatma komutu gonderildi."
+        fi
+    fi
+}
+
+fan_speed_menu() {
+    local path="$BASE/fan_speed"
+    local current
+    local value
+    local cpu
+    local gpu
+
+    current="$(read_value "$path")"
+
+    value="$(dialog_input "Fan Hizi" \
+        "CPU ve GPU fan degerlerini su formatta girin:
+
+CPU,GPU
+
+Ornek:
+50,70
+
+Aralik:
+0   Otomatik
+1   Minimum
+100 Maksimum
+
+Mevcut deger:" "$current")" || return
+
+    if [[ ! "$value" =~ ^[0-9]+,[0-9]+$ ]]; then
+        dialog_msg "Fan Hizi" \
+            "Gecersiz format.
+
+Ornek:
+50,70"
+        return
+    fi
+
+    cpu="${value%,*}"
+    gpu="${value#*,}"
+
+    if ! is_between "$cpu" 0 100 || ! is_between "$gpu" 0 100; then
+        dialog_msg "Fan Hizi" \
+            "CPU ve GPU degerleri 0 ile 100 arasinda olmalidir."
+        return
+    fi
+
+    if write_value "$path" "$cpu,$gpu"; then
+        dialog_msg "Fan Hizi" \
+            "Fan hizlari ayarlandi.
+
+CPU: $cpu
+GPU: $gpu"
+    fi
+}
+
+usb_charging_menu() {
+    local path="$BASE/usb_charging"
+    local current
+    local selected
+
+    current="$(read_value "$path")"
+
+    selected="$(dialog_menu "USB Sarj" \
+        "0" "Devre disi [$current]" \
+        "10" "Pil yuzde 10 seviyesine kadar" \
+        "20" "Pil yuzde 20 seviyesine kadar" \
+        "30" "Pil yuzde 30 seviyesine kadar" \
+        "cancel" "Iptal")" || return
+
+    [[ "$selected" == "cancel" ]] && return
+
+    if write_value "$path" "$selected"; then
+        dialog_msg "USB Sarj" \
+            "USB sarj degeri $selected olarak ayarlandi."
+    fi
+}
+
+# ------------------------------------------------------------
+# Klavye RGB
+# ------------------------------------------------------------
+
+per_zone_rgb_menu() {
+    local path="$FOUR_ZONE_BASE/per_zone_mode"
+    local current
+    local value
+    local zone1
+    local zone2
+    local zone3
+    local zone4
+    local brightness
+
+    current="$(read_value "$path")"
+
+    value="$(dialog_input "Bolgesel RGB" \
+        "Format:
+
+RRGGBB,RRGGBB,RRGGBB,RRGGBB,PARLAKLIK
+
+Ornek:
+4287f5,ff5733,33ff57,ff33a6,100
+
+Her renk 6 haneli hexadecimal olmalidir.
+Parlaklik 0 ile 100 arasinda olmalidir.
+
+Mevcut deger:" "$current")" || return
+
+    IFS=',' read -r zone1 zone2 zone3 zone4 brightness <<< "$value"
+
+    if [[ -z "${zone1:-}" ||
+          -z "${zone2:-}" ||
+          -z "${zone3:-}" ||
+          -z "${zone4:-}" ||
+          -z "${brightness:-}" ]]; then
+        dialog_msg "Bolgesel RGB" \
+            "Bes deger girilmelidir."
+        return
+    fi
+
+    if ! is_hex_color "$zone1" ||
+       ! is_hex_color "$zone2" ||
+       ! is_hex_color "$zone3" ||
+       ! is_hex_color "$zone4"; then
+        dialog_msg "Bolgesel RGB" \
+            "Renkler 6 haneli hexadecimal formatinda olmalidir.
+
+Ornek:
+4287f5"
+        return
+    fi
+
+    if ! is_between "$brightness" 0 100; then
+        dialog_msg "Bolgesel RGB" \
+            "Parlaklik 0 ile 100 arasinda olmalidir."
+        return
+    fi
+
+    value="$zone1,$zone2,$zone3,$zone4,$brightness"
+
+    if write_value "$path" "$value"; then
+        dialog_msg "Bolgesel RGB" \
+            "Bolge renkleri basariyla uygulandi."
+    fi
+}
+
+rgb_effect_menu() {
+    local path="$FOUR_ZONE_BASE/four_zone_mode"
+    local current
+    local value
+    local mode
+    local speed
+    local brightness
+    local direction
+    local red
+    local green
+    local blue
+
+    current="$(read_value "$path")"
+
+    value="$(dialog_input "RGB Efekti" \
+        "Format:
+
+MOD,HIZ,PARLAKLIK,YON,KIRMIZI,YESIL,MAVI
+
+Deger araliklari:
+
+Mod:        0-7
+Hiz:        0-9
+Parlaklik:  0-100
+Yon:        1-2
+Kirmizi:    0-255
+Yesil:      0-255
+Mavi:       0-255
+
+Ornek:
+3,1,100,2,0,0,0
+
+Mevcut deger:" "$current")" || return
+
+    IFS=',' read -r \
+        mode speed brightness direction red green blue <<< "$value"
+
+    if [[ -z "${mode:-}" ||
+          -z "${speed:-}" ||
+          -z "${brightness:-}" ||
+          -z "${direction:-}" ||
+          -z "${red:-}" ||
+          -z "${green:-}" ||
+          -z "${blue:-}" ]]; then
+        dialog_msg "RGB Efekti" \
+            "Yedi deger girilmelidir."
+        return
+    fi
+
+    if ! is_between "$mode" 0 7 ||
+       ! is_between "$speed" 0 9 ||
+       ! is_between "$brightness" 0 100 ||
+       ! is_between "$direction" 1 2 ||
+       ! is_between "$red" 0 255 ||
+       ! is_between "$green" 0 255 ||
+       ! is_between "$blue" 0 255; then
+        dialog_msg "RGB Efekti" \
+            "Gecersiz deger araligi."
+        return
+    fi
+
+    value="$mode,$speed,$brightness,$direction,$red,$green,$blue"
+
+    if write_value "$path" "$value"; then
+        dialog_msg "RGB Efekti" \
+            "RGB efekti basariyla uygulandi."
+    fi
+}
+
+keyboard_menu() {
+    local selected
+    local options=()
+
+    if [[ -z "$FOUR_ZONE_BASE" ]]; then
+        dialog_msg "Klavye RGB" \
+            "Dort bolgeli klavye dizini bulunamadi.
+
+Bu cihaz:
+- Dort bolgeli RGB desteklemiyor olabilir.
+- Per-key RGB kullaniyor olabilir.
+- Modulu farkli bir sysfs yolu kullaniyor olabilir."
+        return
+    fi
+
+    if zone_file_exists "per_zone_mode"; then
+        options+=("per_zone" "Bolge renklerini ayarla")
+    fi
+
+    if zone_file_exists "four_zone_mode"; then
+        options+=("effect" "RGB efektini ayarla")
+    fi
+
+    options+=("back" "Geri don")
+
+    selected="$(dialog_menu "Klavye RGB" "${options[@]}")" || return
+
+    case "$selected" in
+        per_zone)
+            per_zone_rgb_menu
+            ;;
+        effect)
+            rgb_effect_menu
+            ;;
+        back)
+            return
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------
+# Donanım özellikleri
+# ------------------------------------------------------------
+
+hardware_menu() {
+    local selected
+    local options=()
+
+    if [[ -z "$BASE" ]]; then
+        dialog_msg "Donanim Ayarlari" \
+            "Predator veya Nitro sysfs dizini bulunamadi."
+        return
+    fi
+
+    if file_exists "backlight_timeout"; then
+        options+=(
+            "backlight_timeout"
+            "Klavye zaman asimi [$(read_value "$BASE/backlight_timeout")]"
+        )
+    fi
+
+    if file_exists "battery_calibration"; then
+        options+=(
+            "battery_calibration"
+            "Pil kalibrasyonu [$(read_value "$BASE/battery_calibration")]"
+        )
+    fi
+
+    if file_exists "battery_limiter"; then
+        options+=(
+            "battery_limiter"
+            "Pil limitleyici [$(read_value "$BASE/battery_limiter")]"
+        )
+    fi
+
+    if file_exists "boot_animation_sound"; then
+        options+=(
+            "boot_animation_sound"
+            "Acilis animasyonu ve sesi [$(read_value "$BASE/boot_animation_sound")]"
+        )
+    fi
+
+    if file_exists "fan_speed"; then
+        options+=(
+            "fan_speed"
+            "Fan hizi [$(read_value "$BASE/fan_speed")]"
+        )
+    fi
+
+    if file_exists "lcd_override"; then
+        options+=(
+            "lcd_override"
+            "LCD Override [$(read_value "$BASE/lcd_override")]"
+        )
+    fi
+
+    if file_exists "usb_charging"; then
+        options+=(
+            "usb_charging"
+            "USB sarj [$(read_value "$BASE/usb_charging")]"
+        )
+    fi
+
+    options+=("back" "Geri don")
+
+    selected="$(dialog_menu "$DEVICE_TYPE Ayarlari" "${options[@]}")" || return
+
+    case "$selected" in
+        back)
+            return
+            ;;
+
+        backlight_timeout)
+            toggle_feature \
+                "backlight_timeout" \
+                "Klavye Zaman Asimi" \
+                "Yaklasik 30 saniye islem yapilmazsa RGB isigini kapatir."
+            ;;
+
+        battery_calibration)
+            battery_calibration_menu
+            ;;
+
+        battery_limiter)
+            toggle_feature \
+                "battery_limiter" \
+                "Pil Limitleyici" \
+                "Pil sarjini genellikle yuzde 80 seviyesinde sinirlar."
+            ;;
+
+        boot_animation_sound)
+            toggle_feature \
+                "boot_animation_sound" \
+                "Acilis Animasyonu ve Sesi" \
+                "Ozel acilis animasyonu ve sesini acar veya kapatir."
+            ;;
+
+        fan_speed)
+            fan_speed_menu
+            ;;
+
+        lcd_override)
+            toggle_feature \
+                "lcd_override" \
+                "LCD Override" \
+                "LCD gecikmesini azaltmayi ve ghosting etkisini dusurmeyi dener."
+            ;;
+
+        usb_charging)
+            usb_charging_menu
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------
+# Ana menü
+# ------------------------------------------------------------
+
+about_menu() {
+    dialog_msg "Hakkinda" \
+        "$APP_NAME $VERSION
+
+Acer Predator ve Nitro bilgisayarlar icin
+Linuwu-Sense sysfs arayuzunu kullanan
+Bash tabanli TUI kontrol aracidir.
+
+Algilanan cihaz:
+$DEVICE_TYPE
+
+Algilanan modul:
+$MODULE_NAME
+
+Kontrol yolu:
+${BASE:-Bulunamadi}"
+}
+
+main_menu() {
+    local selected
+
+    while true; do
+        selected="$(dialog_menu "$APP_NAME - $DEVICE_TYPE" \
+            "status" "Sistem durumunu goster" \
+            "profile" "Platform profili" \
+            "hardware" "$DEVICE_TYPE ayarlari" \
+            "keyboard" "Klavye RGB ayarlari" \
+            "about" "Hakkinda" \
+            "exit" "Cikis")" || break
+
+        case "$selected" in
+            status)
+                show_status
+                ;;
+
+            profile)
+                platform_profile_menu
+                ;;
+
+            hardware)
+                hardware_menu
+                ;;
+
+            keyboard)
+                keyboard_menu
+                ;;
+
+            about)
+                about_menu
+                ;;
+
+            exit)
+                break
+                ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------
+# Başlat
+# ------------------------------------------------------------
+
+find_dialog_program
+detect_sysfs_paths
+
+trap 'clear' EXIT INT TERM
+
+main_menu
