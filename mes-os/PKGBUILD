@@ -1,0 +1,25 @@
+# Maintainer: mes-os developer
+pkgname=mes-os
+pkgver=2.0.0
+pkgrel=1
+pkgdesc="Acer Predator and Nitro control TUI for Linuwu-Sense"
+arch=('any')
+license=('GPL3')
+
+depends=(
+    'bash'
+    'dialog'
+    'sudo'
+)
+
+optdepends=(
+    'whiptail: alternative TUI interface'
+)
+
+source=('mes-os')
+sha256sums=('SKIP')
+
+package() {
+    install -Dm755 "$srcdir/mes-os" \
+        "$pkgdir/usr/bin/mes-os"
+}
